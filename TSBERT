@@ -1,0 +1,157 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 19 18:12:21 2024
+
+@author: Administrator
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from transformers import BertConfig, BertPreTrainedModel, BertModel
+import random
+from sklearn.model_selection import train_test_split as tts
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, sequences, mask_probability=0.35):
+        self.sequences = sequences.float()  # Ensure sequences are float32
+        self.mask_probability = mask_probability
+       
+    def __len__(self):
+        return len(self.sequences)
+   
+    def __getitem__(self, idx):
+        sequence = self.sequences[idx].clone()
+       
+        # Create masks for random values
+        masks = torch.zeros_like(sequence)
+        for i in range(len(sequence)):
+            if random.random() < self.mask_probability:
+                masks[i] = 1
+                sequence[i] = 0  # Mask token (0 in this case)
+       
+        return {
+            'input_sequence': sequence,
+            'attention_mask': torch.ones_like(sequence),
+            'masks': masks,
+            'original_sequence': self.sequences[idx]
+        }
+
+class TimeSeriesBERT(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.bert = BertModel(config)
+        self.regressor = nn.Linear(config.hidden_size, 1)
+        self.init_weights()
+   
+    def forward(self, input_sequence, attention_mask=None):
+        # Ensure input_sequence is of type float32
+        input_sequence = input_sequence.float()
+    
+        outputs = self.bert(
+            inputs_embeds=input_sequence.unsqueeze(-1),  # Ensure it's float32
+            attention_mask=attention_mask
+        )
+
+        sequence_output = outputs[0]
+        predictions = self.regressor(sequence_output)
+        return predictions.squeeze(-1)
+
+
+def create_model(sequence_length, hidden_size=256, num_attention_heads=8, num_hidden_layers=6):
+    config = BertConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_hidden_layers=num_hidden_layers,
+        max_position_embeddings=sequence_length,
+        is_decoder=False
+    )
+   
+    model = TimeSeriesBERT(config)
+    return model
+
+class TimeSeriesImputer:
+    def __init__(self, sequence_length, hidden_size=256, batch_size=32, learning_rate=1e-4):
+        self.model = create_model(sequence_length, hidden_size)
+        self.batch_size = batch_size
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss()
+       
+    def train(self, train_sequences, num_epochs=100):
+        dataset = TimeSeriesDataset(train_sequences)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+       
+        self.model.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0
+            for batch in dataloader:
+                input_sequence = batch['input_sequence']
+                attention_mask = batch['attention_mask']
+                masks = batch['masks']
+                original_sequence = batch['original_sequence']
+               
+                self.optimizer.zero_grad()
+               
+                predictions = self.model(input_sequence, attention_mask)
+               
+                # Only compute loss for masked values
+                loss = self.criterion(
+                    predictions[masks == 1],
+                    original_sequence[masks == 1]
+                )
+               
+                loss.backward()
+                self.optimizer.step()
+               
+                epoch_loss += loss.item()
+           
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch + 1}, Loss: {epoch_loss / len(dataloader):.6f}")
+   
+    def impute(self, sequences_with_missing):
+        self.model.eval()
+        dataset = TimeSeriesDataset(sequences_with_missing, mask_probability=0)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size)
+       
+        imputed_sequences = []
+       
+        with torch.no_grad():
+            for batch in dataloader:
+                input_sequence = batch['input_sequence']
+                attention_mask = batch['attention_mask']
+               
+                predictions = self.model(input_sequence, attention_mask)
+                imputed_sequences.append(predictions.numpy())
+       
+        return np.concatenate(imputed_sequences, axis=0)
+
+def save_model(model, file_path="E:\\AUB\\Tutorial\\trained_model.pth"):
+    torch.save(model.state_dict(), file_path)
+    print(f"Model saved to {file_path}")
+def load_model(model, file_path="E:\\AUB\\Tutorial\\trained_model.pth"):
+    model.load_state_dict(torch.load(file_path))
+    model.eval()  # Set the model to evaluation mode
+    print(f"Model loaded from {file_path}")
+    return model
+
+if __name__ == "__main__":
+    # Generate sample data
+    sequence_length = 50
+    
+    data = torch.tensor(np.load("E:\\AUB\\Tutorial\\Solutions.npy"), dtype=torch.float32)
+    for ids in range(int(len(data)/100)):
+        X_train = data[ids]
+    # train_sequences = [X_train,y_train]
+    # Initialize and train the model
+        imputer = TimeSeriesImputer(sequence_length=sequence_length)
+        imputer.train(X_train, num_epochs=5)
+    save_model(imputer.model)
+    # Create test sequence with missing values
+    # test_sequence = train_sequences[:5].clone()
+    # test_sequence[test_sequence > 0] = 0  # Mask positive values
+   
+    # # Impute missing values
+    # imputed_sequences = imputer.impute(test_sequence)
+    # print("Original sequences shape:", train_sequences[:5].shape)
+    # print("Imputed sequences shape:", imputed_sequences.shape)
